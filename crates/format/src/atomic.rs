@@ -50,10 +50,14 @@ pub trait AtomicFs {
     }
     /// [`write_new_progress`](Self::write_new_progress), giving `tmp` the permissions of `like`
     /// (when given) before any byte is written, so a confidential file never sits in a more open
-    /// temporary file. By default it just writes; the permissions are copied afterwards.
+    /// temporary file. By default it writes and then copies the permissions; a refused permission
+    /// change is not an error (see [`tolerate_chmod_refusal`]).
     fn write_new_like(&self, tmp: &Path, bytes: &[u8], progress: &dyn Fn(f32), like: Option<&Path>) -> io::Result<()> {
-        let _ = like;
-        self.write_new_progress(tmp, bytes, progress)
+        self.write_new_progress(tmp, bytes, progress)?;
+        match like {
+            Some(like) => tolerate_chmod_refusal(self.copy_permissions(like, tmp)),
+            None => Ok(()),
+        }
     }
     /// Rename `from` over `to`, replacing it.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
@@ -62,8 +66,18 @@ pub trait AtomicFs {
     /// Flush a directory entry change (Unix); a no-op elsewhere.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     /// Copy the destination's permissions onto the temporary file, so replacing a file keeps its
-    /// mode. If it fails, the save fails instead of publishing the file with other permissions.
+    /// mode. Only [`write_new_like`](Self::write_new_like) calls it.
     fn copy_permissions(&self, from: &Path, to: &Path) -> io::Result<()>;
+}
+
+/// A refused permission change (`EPERM`/`ENOTSUP`) is not an error: file systems such as vfat and
+/// exFAT drives and many SMB/NTFS mounts reject `chmod` yet save fine, and the file then keeps the
+/// mode the mount gives every file. Any other failure is passed on.
+pub fn tolerate_chmod_refusal(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported) => Ok(()),
+        other => other,
+    }
 }
 
 /// The real file system.
@@ -82,9 +96,16 @@ impl AtomicFs for RealFs {
     }
     fn write_new_like(&self, tmp: &Path, bytes: &[u8], progress: &dyn Fn(f32), like: Option<&Path>) -> io::Result<()> {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
-        if let Some(like) = like {
-            f.set_permissions(std::fs::metadata(like)?.permissions())?;
+        // Only Unix has a mode to keep; on Windows the read-only attribute is never copied, so
+        // the temporary file can always be removed if the save fails.
+        #[cfg(unix)]
+        {
+            if let Some(like) = like {
+                tolerate_chmod_refusal(f.set_permissions(std::fs::metadata(like)?.permissions()))?;
+            }
         }
+        #[cfg(not(unix))]
+        let _ = like;
         let mut written = 0usize;
         for chunk in bytes.chunks(WRITE_CHUNK) {
             f.write_all(chunk)?;
@@ -111,8 +132,16 @@ impl AtomicFs for RealFs {
         }
     }
     fn copy_permissions(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let perms = std::fs::metadata(from)?.permissions();
-        std::fs::set_permissions(to, perms)
+        #[cfg(unix)]
+        {
+            let perms = std::fs::metadata(from)?.permissions();
+            std::fs::set_permissions(to, perms)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (from, to);
+            Ok(())
+        }
     }
     fn is_readonly(&self, path: &Path) -> bool {
         std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().readonly())
@@ -219,15 +248,6 @@ pub fn atomic_write_with_progress(fs: &dyn AtomicFs, retry: RenameRetry, path: &
         }
     }
     let tmp = tmp.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, format!("{}: could not create a temporary file", dir.display())))?;
-
-    // Keep the existing file's mode (e.g. 0600) instead of the process default. Failing to do so
-    // must not publish the file with looser permissions, so it fails the save.
-    if like.is_some()
-        && let Err(e) = fs.copy_permissions(&target, &tmp)
-    {
-        let _ = fs.remove(&tmp);
-        return Err(context(e, format!("cannot save {}: could not keep the file's permissions; {UNCHANGED}", path.display())));
-    }
 
     if let Err(e) = retry_rename(retry, || fs.rename(&tmp, &target)) {
         let _ = fs.remove(&tmp);

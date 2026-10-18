@@ -87,11 +87,16 @@ impl AuthorizedWorkspace {
         options.write(true).create_new(true);
         let written = root.dir.open_with(&tmp, &options).and_then(|mut file| {
             // Replacing a file keeps its permissions (e.g. 0600), set before any byte is written;
-            // a new file keeps the process default.
-            match root.dir.metadata(&relative) {
-                Ok(existing) => file.set_permissions(existing.permissions())?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+            // a new file keeps the process default. A file system that refuses chmod (vfat/exFAT,
+            // SMB/NTFS mounts) still saves. Unix only: copying the Windows read-only attribute
+            // would stop the temporary file from being removed if the save fails.
+            #[cfg(unix)]
+            {
+                match root.dir.metadata(&relative) {
+                    Ok(existing) => photocraft_format::atomic::tolerate_chmod_refusal(file.set_permissions(existing.permissions()))?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
             }
             file.write_all(bytes)?;
             // Falls back to a plain fsync on shares that refuse a full flush (#1336).
