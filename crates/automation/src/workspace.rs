@@ -85,6 +85,14 @@ impl AuthorizedWorkspace {
         let tmp = parent.join(photocraft_format::atomic::temp_name(&leaf));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        // Replacing a file: create the temporary file owner-only, so a refused chmod below never
+        // leaves the copy more open than the file it replaces.
+        #[cfg(unix)]
+        {
+            if root.dir.metadata(&relative).is_ok() {
+                cap_std::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            }
+        }
         let written = root.dir.open_with(&tmp, &options).and_then(|mut file| {
             // Replacing a file keeps its permissions (e.g. 0600), set before any byte is written;
             // a new file keeps the process default. A file system that refuses chmod (vfat/exFAT,

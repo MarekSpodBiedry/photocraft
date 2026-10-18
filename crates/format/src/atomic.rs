@@ -95,7 +95,15 @@ impl AtomicFs for RealFs {
         self.write_new_like(tmp, bytes, progress, None)
     }
     fn write_new_like(&self, tmp: &Path, bytes: &[u8], progress: &dyn Fn(f32), like: Option<&Path>) -> io::Result<()> {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Replacing a file: start owner-only, so if the file system refuses the permission copy
+        // below the temporary file is never more open than the default mode would make it.
+        #[cfg(unix)]
+        if like.is_some() {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        let mut f = options.open(tmp)?;
         // Only Unix has a mode to keep; on Windows the read-only attribute is never copied, so
         // the temporary file can always be removed if the save fails.
         #[cfg(unix)]
