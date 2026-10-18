@@ -1826,6 +1826,38 @@ mod tests {
         assert_eq!(s.active().unwrap().is_dirty(), dirty);
     }
 
+    /// #4974: a failed Rasterize on a saved document keeps it clean, whether nothing was eligible
+    /// or a later layer failed after an earlier one was converted.
+    #[test]
+    fn failed_rasterize_keeps_clean_document_clean() {
+        let mut s = session(8);
+        s.execute("layer.newFillLayer.solidColor", json!({"color": "#00ff00"})).unwrap();
+        let mark_saved = |s: &mut Session| {
+            let st = s.active_mut().unwrap();
+            st.saved_revision = st.revision;
+        };
+        mark_saved(&mut s);
+        assert!(!s.active().unwrap().is_dirty());
+        let steps = s.active().unwrap().history.past_len();
+
+        // Nothing eligible: the selected layer is a fill layer, not a type layer.
+        assert!(s.execute("layer.rasterize.type", json!({})).is_err());
+        assert!(!s.active().unwrap().is_dirty());
+        assert_eq!(s.active().unwrap().history.past_len(), steps);
+
+        // A later layer fails after the first was converted.
+        let key = step_key(&s, "rasterize");
+        let id = s.active().unwrap().active_layer.unwrap();
+        let r: Result<()> = crate::analysis_cmds::compound(&mut s, "Rasterize", |s| {
+            assert!(rasterize_one(s, id, None, &key)?);
+            Err(EngineError::Other("later layer failed".into()))
+        });
+        assert!(r.is_err());
+        assert!(matches!(active(&s).content, LayerContent::Fill(_)));
+        assert!(!s.active().unwrap().is_dirty());
+        assert_eq!(s.active().unwrap().history.past_len(), steps);
+    }
+
     #[test]
     fn rasterize_smart_object_layer() {
         let mut s = session(8);
